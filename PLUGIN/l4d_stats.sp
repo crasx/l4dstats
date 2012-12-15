@@ -2982,7 +2982,7 @@ public Action:timer_ShuffleTeams(Handle:timer, any:data)
 		return;
 
 	decl String:query[1024];
-	Format(query, sizeof(query), "SELECT steamid FROM %splayers WHERE ", DbPrefix);
+	Format(query, sizeof(query), "SELECT steamid, (%s) / (%s) as ppm FROM %splayers WHERE ", DB_PLAYERS_TOTALPOINTS, DB_PLAYERS_TOTALPLAYTIME, DbPrefix);
 
 	new maxplayers = GetMaxClients();
 	decl String:SteamID[MAX_LINE_WIDTH], String:where[512];
@@ -7865,16 +7865,16 @@ public ExecuteTeamShuffle(Handle:owner, Handle:hndl, const String:error[], any:d
 	}
 
 	decl String:SteamID[MAX_LINE_WIDTH];
-	new i, team, maxplayers = GetMaxClients(), client, topteam;
-	new SurvivorsLimit = GetConVarInt(cvar_SurvivorLimit), InfectedLimit = GetConVarInt(cvar_InfectedLimit);
+	new i, maxplayers = GetMaxClients(), client;
 	new Handle:PlayersTrie = CreateTrie();
-	new Handle:InfectedArray = CreateArray();
-	new Handle:SurvivorArray = CreateArray();
-
-	for (i = 1; i <= maxplayers; i++)
+	
+	//first move everyone to spec
+		for (i = 1; i <= maxplayers; i++)
 	{
 		if (IsClientConnected(i) && IsClientInGame(i) && !IsClientBot(i))
 		{
+			ChangeRankPlayerTeam(i, TEAM_SPECTATORS);
+			// grab steam ids while we do this
 			GetClientRankAuthString(i, SteamID, sizeof(SteamID));
 
 			if (!SetTrieValue(PlayersTrie, SteamID, i, false))
@@ -7882,147 +7882,42 @@ public ExecuteTeamShuffle(Handle:owner, Handle:hndl, const String:error[], any:d
 				LogError("ExecuteTeamShuffle failed! Reason: Duplicate SteamID while generating shuffled teams.");
 				StatsPrintToChatAllPreFormatted2(true, "Team shuffle failed in an error.");
 
-				SetConVarBool(cvar_EnableRankVote, false);
-
 				ClearTrie(PlayersTrie);
 				CloseHandle(PlayersTrie);
-
 				CloseHandle(hndl);
-
 				return;
 			}
 
-			switch (GetClientTeam(i))
-			{
-				case TEAM_SURVIVORS:
-					PushArrayCell(SurvivorArray, i);
-				case TEAM_INFECTED:
-					PushArrayCell(InfectedArray, i);
-			}
 		}
 	}
-
-	new SurvivorCounter = GetArraySize(SurvivorArray);
-	new InfectedCounter = GetArraySize(InfectedArray);
-
-	i = 0;
-	topteam = 0;
-
+	
+	//choose a random team to start swapping
+	new pushTeam=GetURandomInt()%2+1;// random number between 2 and 3
+	new float:ppmI=0, float:ppmS=0, float:myPPM=0;
+	
+	//loop through results
 	while (SQL_FetchRow(hndl))
 	{
 		SQL_FetchString(hndl, 0, SteamID, sizeof(SteamID));
+		myPPM=SQL_FetchFloat(hndl, 1);
 
-		if (GetTrieValue(PlayersTrie, SteamID, client))
+		if (GetTrieValue(PlayersTrie, SteamID, client)) // client=index of steamid
 		{
-			team = GetClientTeam(client);
-
-			if (i == 0)
-			{
-				if (team == TEAM_SURVIVORS)
-				{
-					RemoveFromArray(SurvivorArray, FindValueInArray(SurvivorArray, client));
-				}
-				else
-				{
-					RemoveFromArray(InfectedArray, FindValueInArray(InfectedArray, client));
-				}
-
-				topteam = team;
-				i++;
-
-				continue;
-			}
-
-			if (i++ % 2)
-			{
-				if (topteam == TEAM_SURVIVORS && team == TEAM_INFECTED)
-				{
-					RemoveFromArray(InfectedArray, FindValueInArray(InfectedArray, client));
-				}
-				else if (topteam == TEAM_INFECTED && team == TEAM_SURVIVORS)
-				{
-					RemoveFromArray(SurvivorArray, FindValueInArray(SurvivorArray, client));
-				}
-			}
+			ChangeRankPlayerTeam(client, pushTeam); // no need to worry about team limits, ChangeRankPlayerTeam handles that
+			if(pushTeam==TEAM_INFECTED)
+				ppmI+=myPPM;
 			else
-			{
-				if (topteam == TEAM_SURVIVORS && team == TEAM_SURVIVORS)
-				{
-					RemoveFromArray(SurvivorArray, FindValueInArray(SurvivorArray, client));
-				}
-				else if (topteam == TEAM_INFECTED && team == TEAM_INFECTED)
-				{
-					RemoveFromArray(InfectedArray, FindValueInArray(InfectedArray, client));
-				}
-			}
-		}
+				ppmS+=myPPM;
+		
+			pushTeam=pushTeam==TEAM_INFECTED?TEAM_SURVIVORS:TEAM_INFECTED;
+		}/// else something went wrong
 	}
+		
+	//do some data
+	StatsPrintToChatAll2(true, "PPM Shuffle Complete. SurvivorPPM: %-.2f InfectedPPM: %-.2f", ppmS, ppmI);
 
-	if (GetArraySize(SurvivorArray) > 0 || GetArraySize(InfectedArray) > 0)
-	{
-		new NewSurvivorCounter = SurvivorCounter - GetArraySize(SurvivorArray) + GetArraySize(InfectedArray);
-		new NewInfectedCounter = InfectedCounter - GetArraySize(InfectedArray) + GetArraySize(SurvivorArray);
-
-		if (NewSurvivorCounter > SurvivorsLimit || NewInfectedCounter > InfectedLimit)
-		{
-			LogError("ExecuteTeamShuffle failed! Reason: Team size limits block Rank Vote functionality. (Survivors Limit = %i [%i] / Infected Limit = %i [%i])", SurvivorsLimit, NewSurvivorCounter, InfectedLimit, NewInfectedCounter);
-			StatsPrintToChatAllPreFormatted2(true, "Team shuffle failed in an error.");
-
-			SetConVarBool(cvar_EnableRankVote, false);
-		}
-		else
-		{
-			CampaignOver = true;
-
-			decl String:Name[32];
-
-			// Change Survivors team to Spectators (TEMPORARILY)
-			for (i = 0; i < GetArraySize(SurvivorArray); i++)
-			{
-				ChangeRankPlayerTeam(GetArrayCell(SurvivorArray, i), TEAM_SPECTATORS);
-			}
-
-			// Change Infected team to Survivors
-			for (i = 0; i < GetArraySize(InfectedArray); i++)
-			{
-				client = GetArrayCell(InfectedArray, i);
-				GetClientName(client, Name, sizeof(Name));
-
-				ChangeRankPlayerTeam(client, TEAM_SURVIVORS);
-
-				StatsPrintToChatAll2(true, "\x05%s \x01was swapped to team \x03Survivors\x01!", Name);
-			}
-
-			// Change Spectators (TEMPORARILY) team to Infected
-			for (i = 0; i < GetArraySize(SurvivorArray); i++)
-			{
-				client = GetArrayCell(SurvivorArray, i);
-				GetClientName(client, Name, sizeof(Name));
-
-				ChangeRankPlayerTeam(client, TEAM_INFECTED);
-
-				StatsPrintToChatAll2(true, "\x05%s \x01was swapped to team \x03Infected\x01!", Name);
-			}
-
-			StatsPrintToChatAllPreFormatted2(true, "Team shuffle by player PPM \x03DONE\x01.");
-
-			if (EnableSounds_Rankvote && GetConVarBool(cvar_SoundsEnabled))
-				EmitSoundToAll(SOUND_RANKVOTE);
-		}
-	}
-	else
-	{
-		StatsPrintToChatAllPreFormatted2(true, "Teams are already even by player PPM.");
-	}
-
-	ClearArray(SurvivorArray);
-	ClearArray(InfectedArray);
 	ClearTrie(PlayersTrie);
-
-	CloseHandle(SurvivorArray);
-	CloseHandle(InfectedArray);
 	CloseHandle(PlayersTrie);
-
 	CloseHandle(hndl);
 }
 
